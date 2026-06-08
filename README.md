@@ -24,6 +24,9 @@ the browser; there is no backend.
 - **Font controls** (apply instantly to EPUB text):
   - Family: Georgia, Merriweather, Lato, Palatino, Courier New.
   - Size: 12 px – 32 px.
+- **Table of contents** — a contents drawer (☰ in the control bar) listing
+  chapters (EPUB, from its navigation or chapter headings) or bookmarks (PDF
+  outline). Click an entry to jump straight to it.
 - **Page color** picker — Paper, White, Sepia, Gray and Night themes, applied
   live to the whole reading surface.
 - **Progress indicator** in the control bar — percentage for EPUB, plus

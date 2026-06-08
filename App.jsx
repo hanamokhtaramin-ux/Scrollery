@@ -174,6 +174,14 @@ function bodyHtmlFromXml(raw) {
   return body ? body.innerHTML : "";
 }
 
+const fileBase = (href) => (href || "").split("#")[0].split("/").pop();
+
+function firstHeadingText(html) {
+  const m = html.match(/<h[1-6][^>]*>([\s\S]*?)<\/h[1-6]>/i);
+  if (!m) return "";
+  return m[1].replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+}
+
 async function extractEpub(book, onProgress) {
   // Only wait for the package + spine. book.ready also waits on navigation and
   // cover parsing, which REJECT on plenty of otherwise-readable EPUBs — that
@@ -181,11 +189,26 @@ async function extractEpub(book, onProgress) {
   await book.opened;
   try { await book.loaded.spine; } catch (e) { /* keep going with the spine we have */ }
 
+  // Best-effort: read the EPUB's own navigation for nice chapter titles.
+  const navByFile = {};
+  try {
+    await book.loaded.navigation;
+    const flat = [];
+    const walk = (arr) => (arr || []).forEach((it) => { flat.push(it); if (it.subitems) walk(it.subitems); });
+    walk(book.navigation && book.navigation.toc);
+    flat.forEach((it) => {
+      const b = fileBase(it.href);
+      const label = (it.label || "").trim();
+      if (b && label && !navByFile[b]) navByFile[b] = label;
+    });
+  } catch (e) { /* navless EPUB — we fall back to headings */ }
+
   let items = [];
   try { items = (book.spine && book.spine.spineItems) || []; } catch (e) { items = []; }
   if (!items.length) throw new Error("no readable chapters in spine");
 
   let html = "";
+  const toc = [];
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     if (onProgress) onProgress(i + 1, items.length);
@@ -216,11 +239,44 @@ async function extractEpub(book, onProgress) {
     }
 
     content = sanitizeHtml(content);
-    if (content.trim()) html += `<section class="epub-section">${content}</section>`;
+    if (content.trim()) {
+      const id = `epub-sec-${toc.length}`;
+      const label =
+        navByFile[fileBase(item.href)] ||
+        firstHeadingText(content) ||
+        `Chapter ${toc.length + 1}`;
+      toc.push({ id, label, level: 0, page: null });
+      html += `<section class="epub-section" id="${id}">${content}</section>`;
+    }
   }
 
   if (!html) throw new Error("chapters were empty after parsing");
-  return html;
+  return { html, toc };
+}
+
+// Read a PDF's outline/bookmarks into a flat, indented table of contents.
+async function buildPdfToc(pdf) {
+  let outline = null;
+  try { outline = await pdf.getOutline(); } catch (e) { outline = null; }
+  if (!outline || !outline.length) return [];
+
+  const toc = [];
+  const visit = async (items, level) => {
+    for (const it of items) {
+      let page = null;
+      try {
+        let dest = it.dest;
+        if (typeof dest === "string") dest = await pdf.getDestination(dest);
+        if (Array.isArray(dest) && dest[0]) {
+          page = (await pdf.getPageIndex(dest[0])) + 1;
+        }
+      } catch (e) { /* unresolved destination — skip the link */ }
+      if (page) toc.push({ id: `pdf-page-${page}`, label: (it.title || "").trim() || `Page ${page}`, level, page });
+      if (it.items && it.items.length) await visit(it.items, level + 1);
+    }
+  };
+  await visit(outline, 0);
+  return toc;
 }
 
 /* ------------------------------------------------------------------ *
@@ -238,6 +294,8 @@ function App() {
 
   // Content
   const [epubHtml, setEpubHtml] = useState("");
+  const [toc, setToc] = useState([]);
+  const [tocOpen, setTocOpen] = useState(false);
   const [fileName, setFileName] = useState("");
 
   // Library
@@ -437,6 +495,20 @@ function App() {
     }
   }, [epubHtml, mode, applyRestore]);
 
+  // Jump to a table-of-contents entry.
+  const goTo = useCallback((id) => {
+    setTocOpen(false);
+    pause();
+    const el = scrollRef.current;
+    const target = id && document.getElementById(id);
+    if (el && target) {
+      const c = el.getBoundingClientRect();
+      const t = target.getBoundingClientRect();
+      el.scrollTop = Math.max(0, el.scrollTop + (t.top - c.top) - 24);
+      updateProgress();
+    }
+  }, [pause, updateProgress]);
+
   /* ---------------------------------------------------------------- *
    * Rendering
    * ---------------------------------------------------------------- */
@@ -465,6 +537,7 @@ function App() {
 
         const canvas = document.createElement("canvas");
         canvas.className = "pdf-page";
+        canvas.id = `pdf-page-${n}`;
         canvas.width = Math.floor(viewport.width * dpr);
         canvas.height = Math.floor(viewport.height * dpr);
         canvas.style.width = viewport.width + "px";
@@ -477,6 +550,7 @@ function App() {
           transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined,
         }).promise;
       }
+      try { setToc(await buildPdfToc(pdf)); } catch (e) { setToc([]); }
       applyRestore();
     } catch (err) {
       console.error(err);
@@ -493,9 +567,10 @@ function App() {
     try {
       if (!window.ePub) throw new Error("EPUB engine didn't load — check your connection");
       const book = window.ePub(buffer);
-      const html = await extractEpub(book, (i, total) =>
+      const { html, toc: epubToc } = await extractEpub(book, (i, total) =>
         setLoadingMsg(`Loading chapter ${i} of ${total}…`)
       );
+      setToc(epubToc);
       setEpubHtml(html); // restore happens in the epubHtml effect
     } catch (err) {
       console.error("EPUB load failed:", err);
@@ -524,6 +599,8 @@ function App() {
   const openRecord = useCallback((rec) => {
     setError("");
     setEpubHtml("");
+    setToc([]);
+    setTocOpen(false);
     setProgress(0);
     setCurrentPage(0);
     setTotalPages(0);
@@ -603,6 +680,8 @@ function App() {
     setReady(false);
     setMode(null);
     setEpubHtml("");
+    setToc([]);
+    setTocOpen(false);
     setFileName("");
     setProgress(0);
     setCurrentPage(0);
@@ -663,10 +742,16 @@ function App() {
 
           {error && !loading && <div style={S.errorToast}>{error}</div>}
 
+          {tocOpen && toc.length > 0 && (
+            <TocDrawer theme={theme} toc={toc} onGo={goTo} onClose={() => setTocOpen(false)} />
+          )}
+
           <ControlBar
             theme={theme}
             playing={playing}
             onToggle={togglePlay}
+            hasToc={toc.length > 0}
+            onToc={() => setTocOpen((v) => !v)}
             speed={speed}
             onSpeed={setSpeed}
             fontFamily={fontFamily}
@@ -783,11 +868,50 @@ function LibraryCard({ book, theme, onOpen, onRemove }) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Table of contents drawer
+ * ------------------------------------------------------------------ */
+
+function TocDrawer({ theme, toc, onGo, onClose }) {
+  return (
+    <div style={S.tocOverlay} onClick={onClose}>
+      <div
+        className="toc-panel"
+        style={{
+          ...S.tocPanel,
+          background: theme.dark ? "rgba(28,26,24,0.97)" : "rgba(255,255,255,0.97)",
+          color: theme.text,
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div style={{ ...S.tocHead, borderColor: theme.dark ? "rgba(255,255,255,0.12)" : "rgba(0,0,0,0.08)" }}>
+          <span style={{ ...S.tocTitle, color: theme.muted }}>Contents</span>
+          <button style={{ ...S.tocClose, color: theme.muted }} onClick={onClose} aria-label="Close contents">✕</button>
+        </div>
+        <div style={S.tocList} className="toc-list">
+          {toc.map((t, i) => (
+            <button
+              key={i}
+              className="toc-item"
+              style={{ ...S.tocItem, color: theme.text, paddingLeft: 18 + t.level * 16 }}
+              onClick={() => onGo(t.id)}
+              title={t.label}
+            >
+              <span style={S.tocLabel}>{t.label}</span>
+              {t.page ? <span style={{ ...S.tocPage, color: theme.muted }}>{t.page}</span> : null}
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ *
  * Control bar
  * ------------------------------------------------------------------ */
 
 function ControlBar({
-  theme, playing, onToggle, speed, onSpeed, fontFamily, onFontFamily,
+  theme, playing, onToggle, hasToc, onToc, speed, onSpeed, fontFamily, onFontFamily,
   fontSize, onFontSize, themeId, onTheme, progressLabel, onReset,
 }) {
   const dark = theme.dark;
@@ -800,6 +924,17 @@ function ControlBar({
   return (
     <div style={S.barWrap}>
       <div style={{ ...S.bar, background: barBg }} className="control-bar">
+        {hasToc && (
+          <button
+            style={{ ...S.resetBtn, background: fieldBg, color: muted, fontSize: 16 }}
+            onClick={onToc}
+            className="icon-btn"
+            title="Table of contents"
+            aria-label="Table of contents"
+          >
+            ☰
+          </button>
+        )}
         <button
           style={{ ...S.playBtn, ...(playing ? S.playBtnOn : null) }}
           onClick={onToggle}
@@ -954,6 +1089,8 @@ function GlobalStyle({ fontFamily, fontSize, theme }) {
     .play-btn:hover { transform: scale(1.05); }
     .play-btn:active { transform: scale(0.96); }
     .reset-btn:hover { transform: rotate(90deg); }
+    .icon-btn { transition: transform 0.12s ease, background 0.18s ease; }
+    .icon-btn:hover { transform: scale(1.08); }
 
     .dropzone { transition: border-color 0.2s ease, background 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease; }
     .dropzone:hover { transform: translateY(-2px); box-shadow: 0 18px 50px rgba(0,0,0,0.12); }
@@ -962,6 +1099,13 @@ function GlobalStyle({ fontFamily, fontSize, theme }) {
     .lib-card:hover { transform: translateY(-3px); box-shadow: 0 14px 36px rgba(0,0,0,0.14); }
     .lib-card .lib-del { opacity: 0; transition: opacity 0.15s ease; }
     .lib-card:hover .lib-del { opacity: 1; }
+
+    .toc-panel { animation: tocIn 0.22s cubic-bezier(0.22,1,0.36,1); }
+    @keyframes tocIn { from { transform: translateX(-100%); } to { transform: translateX(0); } }
+    .toc-item { transition: background 0.12s ease; }
+    .toc-item:hover { background: ${theme.dark ? "rgba(255,255,255,0.07)" : "rgba(0,0,0,0.05)"}; }
+    .toc-list::-webkit-scrollbar { width: 8px; }
+    .toc-list::-webkit-scrollbar-thumb { background: ${theme.dark ? "rgba(255,255,255,0.18)" : "rgba(0,0,0,0.16)"}; border-radius: 8px; }
 
     .spinner { animation: spin 0.9s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
@@ -1048,6 +1192,30 @@ const S = {
     background: "#fff", color: "#b4452f", padding: "12px 20px", borderRadius: 12,
     boxShadow: "0 8px 28px rgba(0,0,0,0.16)", fontSize: 14, maxWidth: "90vw",
   },
+
+  // Table of contents
+  tocOverlay: {
+    position: "fixed", inset: 0, zIndex: 20, background: "rgba(0,0,0,0.28)",
+    backdropFilter: "blur(2px)", display: "flex",
+  },
+  tocPanel: {
+    width: "min(340px, 84vw)", height: "100%", display: "flex", flexDirection: "column",
+    boxShadow: "8px 0 40px rgba(0,0,0,0.22)", backdropFilter: "blur(16px)",
+  },
+  tocHead: {
+    display: "flex", alignItems: "center", justifyContent: "space-between",
+    padding: "20px 20px 14px", borderBottom: "1px solid rgba(0,0,0,0.08)", flex: "0 0 auto",
+  },
+  tocTitle: { fontSize: 12, fontWeight: 700, letterSpacing: "0.12em", textTransform: "uppercase" },
+  tocClose: { border: "none", background: "transparent", cursor: "pointer", fontSize: 15, lineHeight: 1, padding: 4 },
+  tocList: { overflowY: "auto", padding: "8px 0 24px", flex: 1 },
+  tocItem: {
+    display: "flex", alignItems: "baseline", gap: 10, width: "100%",
+    border: "none", background: "transparent", cursor: "pointer", textAlign: "left",
+    padding: "9px 18px", fontSize: 14, lineHeight: 1.4,
+  },
+  tocLabel: { flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  tocPage: { fontSize: 12, fontVariantNumeric: "tabular-nums", flex: "0 0 auto" },
 
   // Control bar
   barWrap: {
