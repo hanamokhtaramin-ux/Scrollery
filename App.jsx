@@ -161,54 +161,65 @@ function sanitizeHtml(html) {
     .replace(/\son\w+="[^"]*"/gi, "");
 }
 
-async function extractEpub(book, onProgress) {
-  await book.ready;
-  let items = [];
+function bodyHtmlFromXml(raw) {
+  if (!raw) return "";
+  let doc;
   try {
-    items = (book.spine && book.spine.spineItems) || [];
-  } catch (e) {
-    items = [];
+    doc = new DOMParser().parseFromString(raw, "application/xhtml+xml");
+    if (doc.querySelector("parsererror")) throw new Error("xhtml");
+  } catch (_) {
+    doc = new DOMParser().parseFromString(raw, "text/html");
   }
+  const body = doc.querySelector("body");
+  return body ? body.innerHTML : "";
+}
+
+async function extractEpub(book, onProgress) {
+  // Only wait for the package + spine. book.ready also waits on navigation and
+  // cover parsing, which REJECT on plenty of otherwise-readable EPUBs — that
+  // rejection was surfacing as "cannot read it".
+  await book.opened;
+  try { await book.loaded.spine; } catch (e) { /* keep going with the spine we have */ }
+
+  let items = [];
+  try { items = (book.spine && book.spine.spineItems) || []; } catch (e) { items = []; }
+  if (!items.length) throw new Error("no readable chapters in spine");
 
   let html = "";
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
     if (onProgress) onProgress(i + 1, items.length);
-
     let content = "";
-    // Primary path: let epub.js load & parse the section.
-    try {
-      const node = await item.load(book.load.bind(book));
-      let el = node;
-      if (el && el.body) el = el.body; // a full Document was returned
-      content = el && el.innerHTML ? el.innerHTML : "";
-      if (item.unload) item.unload();
-    } catch (e) {
-      content = "";
+
+    // Archive-first: read the raw XHTML straight from the zip. This is the most
+    // reliable path and avoids epub.js's rendering hooks entirely.
+    if (book.archive && book.archive.getText) {
+      const candidates = [item.url, item.canonical, item.href].filter(Boolean);
+      for (let c = 0; c < candidates.length && !content; c++) {
+        try {
+          const raw = await book.archive.getText(candidates[c]);
+          content = bodyHtmlFromXml(raw);
+        } catch (e) { /* try the next candidate path */ }
+      }
     }
 
-    // Fallback: pull the raw XHTML straight out of the archive.
+    // Fallback: let epub.js load & parse the section itself.
     if (!content) {
       try {
-        const href = item.url || item.href || item.canonical;
-        const raw = await book.archive.getText(href);
-        let doc;
-        try {
-          doc = new DOMParser().parseFromString(raw, "application/xhtml+xml");
-          if (doc.querySelector("parsererror")) throw new Error("xhtml");
-        } catch (_) {
-          doc = new DOMParser().parseFromString(raw, "text/html");
-        }
-        const body = doc.querySelector("body");
-        content = body ? body.innerHTML : "";
-      } catch (e) {
-        content = "";
-      }
+        const node = await item.load(book.load.bind(book));
+        let el = node;
+        if (el && el.nodeType === 9) el = el.body || el;            // a Document
+        else if (el && el.querySelector) el = el.querySelector("body") || el; // an <html> element
+        content = el && el.innerHTML ? el.innerHTML : "";
+        if (item.unload) item.unload();
+      } catch (e) { content = ""; }
     }
 
     content = sanitizeHtml(content);
     if (content.trim()) html += `<section class="epub-section">${content}</section>`;
   }
+
+  if (!html) throw new Error("chapters were empty after parsing");
   return html;
 }
 
@@ -435,6 +446,7 @@ function App() {
     setLoadingMsg("Rendering PDF…");
     setError("");
     try {
+      if (!window.pdfjsLib) throw new Error("PDF engine didn't load — check your connection");
       const pdf = await window.pdfjsLib.getDocument({ data: buffer }).promise;
       setTotalPages(pdf.numPages);
       totalPagesRef.current = pdf.numPages;
@@ -479,15 +491,16 @@ function App() {
     setLoadingMsg("Parsing EPUB…");
     setError("");
     try {
+      if (!window.ePub) throw new Error("EPUB engine didn't load — check your connection");
       const book = window.ePub(buffer);
       const html = await extractEpub(book, (i, total) =>
         setLoadingMsg(`Loading chapter ${i} of ${total}…`)
       );
-      if (!html) throw new Error("No readable content found.");
       setEpubHtml(html); // restore happens in the epubHtml effect
     } catch (err) {
-      console.error(err);
-      setError("Could not read this EPUB. It may be corrupted or DRM-protected.");
+      console.error("EPUB load failed:", err);
+      const detail = err && err.message ? err.message : "unknown error";
+      setError(`Could not read this EPUB — ${detail}.`);
     } finally {
       setLoading(false);
     }
