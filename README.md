@@ -24,8 +24,14 @@ the browser; there is no backend.
 - **Font controls** (apply instantly to EPUB text):
   - Family: Georgia, Merriweather, Lato, Palatino, Courier New.
   - Size: 12 px – 32 px.
+- **Page color** picker — Paper, White, Sepia, Gray and Night themes, applied
+  live to the whole reading surface.
 - **Progress indicator** in the control bar — percentage for EPUB, plus
   `Page x / y` for PDF.
+- **Remembered Library** — every book you open is saved locally (IndexedDB),
+  along with how far you've read. Reopen the app and your shelf is waiting;
+  click any book to jump straight back to where you left off. Font, size,
+  speed and color preferences persist too (localStorage).
 
 ## Running it
 
