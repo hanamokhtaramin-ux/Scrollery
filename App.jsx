@@ -39,8 +39,8 @@ const SPEED_MIN = 0.2; // px / frame — barely moving
 const SPEED_MAX = 3.0; // px / frame — brisk reading pace
 const PAGE_WIDTH = 820; // max content width, like a book column
 
-const PDF_WORKER =
-  "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+// Vendored locally (see ./vendor) so nothing is fetched from a CDN at runtime.
+const PDF_WORKER = "vendor/pdf.worker.min.js";
 
 if (window.pdfjsLib) {
   window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDF_WORKER;

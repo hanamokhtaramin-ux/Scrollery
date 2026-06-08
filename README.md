@@ -36,9 +36,11 @@ the browser; there is no backend.
 ## Running it
 
 The app is a single React component, [`App.jsx`](./App.jsx), hosted by
-[`index.html`](./index.html), which pulls React, pdf.js, epub.js and Babel from
-a CDN. Because the browser fetches `App.jsx`, it needs to be served over HTTP
-(opening `index.html` via `file://` will not work).
+[`index.html`](./index.html). All libraries (React, pdf.js, epub.js, JSZip and
+Babel) are **vendored locally in [`vendor/`](./vendor)** — nothing is fetched
+from a CDN at runtime, so it works on locked-down networks and offline. Because
+the browser fetches `App.jsx`, it still needs to be served over HTTP (opening
+`index.html` via `file://` will not work).
 
 From this folder, run any static server, for example:
 
