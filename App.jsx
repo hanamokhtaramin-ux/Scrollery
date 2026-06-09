@@ -136,6 +136,14 @@ async function idbSaveProgress(id, progress) {
   await idbPut(rec);
 }
 
+// Merge a partial patch (e.g. bookmarks / highlights) into a stored book.
+async function idbPatch(id, patch) {
+  const rec = await idbGet(id);
+  if (!rec) return;
+  Object.assign(rec, patch);
+  await idbPut(rec);
+}
+
 // Strip the heavy `data` buffer before putting records into React state.
 const toMeta = (rec) => ({
   id: rec.id,
@@ -280,6 +288,67 @@ async function buildPdfToc(pdf) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Highlight anchoring — store selections as character offsets within a
+ * chapter section, then re-wrap them in <mark> on load. Offsets are stable
+ * because wrapping never changes a section's textContent.
+ * ------------------------------------------------------------------ */
+
+const HL_COLORS = [
+  { id: "yellow", value: "#ffe27a" },
+  { id: "green", value: "#bce6a6" },
+  { id: "pink", value: "#f7b8d2" },
+  { id: "blue", value: "#aed6f5" },
+];
+
+// Character offset of a (container, offset) point within `root`'s text.
+function pointOffset(root, container, offset) {
+  const r = document.createRange();
+  r.selectNodeContents(root);
+  try { r.setEnd(container, offset); } catch (e) { return 0; }
+  return r.toString().length;
+}
+
+function textNodesOf(root) {
+  const nodes = [];
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+  let n;
+  while ((n = walker.nextNode())) nodes.push(n);
+  return nodes;
+}
+
+// Wrap the [start, end) character range of a section in <mark> elements.
+function wrapRange(section, start, end, id, color) {
+  if (!section || end <= start) return;
+  let pos = 0;
+  for (const node of textNodesOf(section)) {
+    const len = node.nodeValue.length;
+    const ns = pos, ne = pos + len;
+    pos = ne;
+    const s = Math.max(start, ns), e = Math.min(end, ne);
+    if (s < e) {
+      const localStart = s - ns, localEnd = e - ns;
+      let target = node;
+      if (localEnd < len) target.splitText(localEnd);
+      if (localStart > 0) target = target.splitText(localStart);
+      const mark = document.createElement("mark");
+      mark.className = "hl";
+      mark.dataset.hlId = id;
+      mark.style.background = color;
+      target.parentNode.insertBefore(mark, target);
+      mark.appendChild(target);
+    }
+  }
+}
+
+function unwrapHighlight(mark) {
+  const p = mark.parentNode;
+  if (!p) return;
+  while (mark.firstChild) p.insertBefore(mark.firstChild, mark);
+  p.removeChild(mark);
+  p.normalize();
+}
+
+/* ------------------------------------------------------------------ *
  * App
  * ------------------------------------------------------------------ */
 
@@ -297,6 +366,12 @@ function App() {
   const [toc, setToc] = useState([]);
   const [tocOpen, setTocOpen] = useState(false);
   const [fileName, setFileName] = useState("");
+
+  // Bookmarks, highlights, selection popover, transient toast
+  const [bookmarks, setBookmarks] = useState([]);
+  const [highlights, setHighlights] = useState([]);
+  const [popover, setPopover] = useState({ visible: false });
+  const [flash, setFlash] = useState("");
 
   // Library
   const [library, setLibrary] = useState([]);
@@ -329,6 +404,11 @@ function App() {
   const currentBookIdRef = useRef(null);
   const restoreRatioRef = useRef(0);
   const saveTimerRef = useRef(null);
+  const epubRef = useRef(null);
+  const highlightsRef = useRef([]);
+  const pendingSelRef = useRef(null);
+
+  useEffect(() => { highlightsRef.current = highlights; }, [highlights]);
 
   // Persist preferences
   useEffect(() => { speedRef.current = speed; savePref("speed", speed); }, [speed]);
@@ -488,26 +568,168 @@ function App() {
     updateProgress();
   }, [updateProgress]);
 
-  // EPUB html is injected by React, so restore after it paints.
+  // EPUB html is injected by React, so re-apply highlights and restore the
+  // saved position after it paints.
   useEffect(() => {
     if (mode === "epub" && epubHtml) {
-      requestAnimationFrame(() => requestAnimationFrame(applyRestore));
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        highlightsRef.current.forEach((h) => {
+          wrapRange(document.getElementById(h.sectionId), h.start, h.end, h.id, h.color);
+        });
+        applyRestore();
+      }));
     }
   }, [epubHtml, mode, applyRestore]);
+
+  // Scroll an element (by id) to the top of the reader.
+  const scrollToTarget = useCallback((target, offset) => {
+    const el = scrollRef.current;
+    if (!el || !target) return;
+    const c = el.getBoundingClientRect();
+    const t = target.getBoundingClientRect();
+    el.scrollTop = Math.max(0, el.scrollTop + (t.top - c.top) - (offset || 24));
+    updateProgress();
+  }, [updateProgress]);
 
   // Jump to a table-of-contents entry.
   const goTo = useCallback((id) => {
     setTocOpen(false);
     pause();
+    scrollToTarget(id && document.getElementById(id), 24);
+  }, [pause, scrollToTarget]);
+
+  // Jump to a saved scroll ratio (bookmarks).
+  const goToRatio = useCallback((ratio) => {
+    setTocOpen(false);
+    pause();
     const el = scrollRef.current;
-    const target = id && document.getElementById(id);
-    if (el && target) {
-      const c = el.getBoundingClientRect();
-      const t = target.getBoundingClientRect();
-      el.scrollTop = Math.max(0, el.scrollTop + (t.top - c.top) - 24);
-      updateProgress();
-    }
+    if (!el) return;
+    const max = el.scrollHeight - el.clientHeight;
+    el.scrollTop = Math.round(ratio * max);
+    updateProgress();
   }, [pause, updateProgress]);
+
+  const goToHighlight = useCallback((hl) => {
+    setTocOpen(false);
+    pause();
+    scrollToTarget(document.querySelector(`mark[data-hl-id="${hl.id}"]`), 60);
+  }, [pause, scrollToTarget]);
+
+  /* ---------------------------------------------------------------- *
+   * Bookmarks
+   * ---------------------------------------------------------------- */
+
+  const addBookmark = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const max = el.scrollHeight - el.clientHeight;
+    const ratio = max > 0 ? el.scrollTop / max : 0;
+    let label;
+    let page = null;
+    if (modeRef.current === "pdf" && totalPagesRef.current) {
+      page = Math.min(totalPagesRef.current, Math.floor(ratio * totalPagesRef.current) + 1);
+      label = `Page ${page}`;
+    } else {
+      const box = el.getBoundingClientRect();
+      const at = document.elementFromPoint(box.left + box.width / 2, box.top + 90);
+      const txt = ((at && at.textContent) || "").replace(/\s+/g, " ").trim();
+      label = txt ? txt.slice(0, 48) + (txt.length > 48 ? "…" : "") : `${Math.round(ratio * 100)}% read`;
+    }
+    const bm = { id: "bm-" + Date.now(), ratio, label, page, createdAt: Date.now() };
+    setBookmarks((prev) => {
+      const next = [...prev, bm].sort((a, b) => a.ratio - b.ratio);
+      if (currentBookIdRef.current) idbPatch(currentBookIdRef.current, { bookmarks: next }).catch(() => {});
+      return next;
+    });
+    setFlash("Bookmark added");
+    clearTimeout(addBookmark._t);
+    addBookmark._t = setTimeout(() => setFlash(""), 1500);
+  }, []);
+
+  const removeBookmark = useCallback((id) => {
+    setBookmarks((prev) => {
+      const next = prev.filter((b) => b.id !== id);
+      if (currentBookIdRef.current) idbPatch(currentBookIdRef.current, { bookmarks: next }).catch(() => {});
+      return next;
+    });
+  }, []);
+
+  /* ---------------------------------------------------------------- *
+   * Highlights (EPUB text layer)
+   * ---------------------------------------------------------------- */
+
+  const addHighlight = useCallback((color) => {
+    const sel = pendingSelRef.current;
+    setPopover({ visible: false });
+    if (!sel) return;
+    const id = "hl-" + Date.now();
+    const hl = { ...sel, id, color };
+    wrapRange(document.getElementById(sel.sectionId), sel.start, sel.end, id, color);
+    const s = window.getSelection();
+    if (s) s.removeAllRanges();
+    pendingSelRef.current = null;
+    setHighlights((prev) => {
+      const next = [...prev, hl];
+      if (currentBookIdRef.current) idbPatch(currentBookIdRef.current, { highlights: next }).catch(() => {});
+      return next;
+    });
+  }, []);
+
+  const removeHighlight = useCallback((id) => {
+    setPopover({ visible: false });
+    document.querySelectorAll(`mark[data-hl-id="${id}"]`).forEach(unwrapHighlight);
+    setHighlights((prev) => {
+      const next = prev.filter((h) => h.id !== id);
+      if (currentBookIdRef.current) idbPatch(currentBookIdRef.current, { highlights: next }).catch(() => {});
+      return next;
+    });
+  }, []);
+
+  // Selection → highlight popover (EPUB only; PDF canvas has no text layer).
+  useEffect(() => {
+    if (!ready || mode !== "epub") return;
+    const root = epubRef.current;
+    if (!root) return;
+
+    const onUp = (e) => {
+      const mark = e.target.closest && e.target.closest("mark.hl");
+      if (mark) {
+        const r = mark.getBoundingClientRect();
+        setPopover({ visible: true, mode: "remove", hlId: mark.dataset.hlId, x: r.left + r.width / 2, y: r.top });
+        return;
+      }
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed || !sel.toString().trim()) return;
+      const range = sel.getRangeAt(0);
+      if (!root.contains(range.startContainer)) return;
+      let section = range.startContainer.nodeType === 3 ? range.startContainer.parentElement : range.startContainer;
+      section = section && section.closest(".epub-section");
+      if (!section) return;
+      const start = pointOffset(section, range.startContainer, range.startOffset);
+      const end = section.contains(range.endContainer)
+        ? pointOffset(section, range.endContainer, range.endOffset)
+        : section.textContent.length;
+      if (end <= start) return;
+      const rect = range.getBoundingClientRect();
+      pendingSelRef.current = { sectionId: section.id, start, end, text: sel.toString() };
+      pause();
+      setPopover({ visible: true, mode: "create", x: rect.left + rect.width / 2, y: rect.top });
+    };
+    const onDown = (e) => {
+      if (!(e.target.closest && e.target.closest(".hl-popover"))) {
+        setPopover((p) => (p.visible ? { visible: false } : p));
+      }
+    };
+
+    root.addEventListener("mouseup", onUp);
+    root.addEventListener("touchend", onUp);
+    document.addEventListener("mousedown", onDown);
+    return () => {
+      root.removeEventListener("mouseup", onUp);
+      root.removeEventListener("touchend", onUp);
+      document.removeEventListener("mousedown", onDown);
+    };
+  }, [ready, mode, pause]);
 
   /* ---------------------------------------------------------------- *
    * Rendering
@@ -601,6 +823,12 @@ function App() {
     setEpubHtml("");
     setToc([]);
     setTocOpen(false);
+    setPopover({ visible: false });
+    const bm = rec.bookmarks || [];
+    const hl = rec.highlights || [];
+    setBookmarks(bm);
+    setHighlights(hl);
+    highlightsRef.current = hl;
     setProgress(0);
     setCurrentPage(0);
     setTotalPages(0);
@@ -682,6 +910,10 @@ function App() {
     setEpubHtml("");
     setToc([]);
     setTocOpen(false);
+    setPopover({ visible: false });
+    setBookmarks([]);
+    setHighlights([]);
+    highlightsRef.current = [];
     setFileName("");
     setProgress(0);
     setCurrentPage(0);
@@ -725,6 +957,7 @@ function App() {
               {mode === "pdf" && <div ref={pdfContainerRef} style={S.pdfWrap} />}
               {mode === "epub" && (
                 <div
+                  ref={epubRef}
                   className="epub-content"
                   dangerouslySetInnerHTML={{ __html: epubHtml }}
                 />
@@ -741,17 +974,34 @@ function App() {
           )}
 
           {error && !loading && <div style={S.errorToast}>{error}</div>}
+          {flash && <div style={{ ...S.flashToast, background: theme.dark ? "rgba(40,38,35,0.92)" : "rgba(40,38,35,0.92)" }}>{flash}</div>}
 
-          {tocOpen && toc.length > 0 && (
-            <TocDrawer theme={theme} toc={toc} onGo={goTo} onClose={() => setTocOpen(false)} />
+          {popover.visible && (
+            <HighlightPopover popover={popover} onPick={addHighlight} onRemove={removeHighlight} />
+          )}
+
+          {tocOpen && (toc.length > 0 || bookmarks.length > 0 || highlights.length > 0) && (
+            <TocDrawer
+              theme={theme}
+              toc={toc}
+              bookmarks={bookmarks}
+              highlights={highlights}
+              onGo={goTo}
+              onGoRatio={goToRatio}
+              onGoHighlight={goToHighlight}
+              onRemoveBookmark={removeBookmark}
+              onRemoveHighlight={removeHighlight}
+              onClose={() => setTocOpen(false)}
+            />
           )}
 
           <ControlBar
             theme={theme}
             playing={playing}
             onToggle={togglePlay}
-            hasToc={toc.length > 0}
+            hasDrawer={toc.length > 0 || bookmarks.length > 0 || highlights.length > 0}
             onToc={() => setTocOpen((v) => !v)}
+            onAddBookmark={addBookmark}
             speed={speed}
             onSpeed={setSpeed}
             fontFamily={fontFamily}
@@ -871,7 +1121,11 @@ function LibraryCard({ book, theme, onOpen, onRemove }) {
  * Table of contents drawer
  * ------------------------------------------------------------------ */
 
-function TocDrawer({ theme, toc, onGo, onClose }) {
+function TocDrawer({
+  theme, toc, bookmarks, highlights,
+  onGo, onGoRatio, onGoHighlight, onRemoveBookmark, onRemoveHighlight, onClose,
+}) {
+  const groupHead = { ...S.tocGroup, color: theme.muted };
   return (
     <div style={S.tocOverlay} onClick={onClose}>
       <div
@@ -885,12 +1139,14 @@ function TocDrawer({ theme, toc, onGo, onClose }) {
       >
         <div style={{ ...S.tocHead, borderColor: theme.dark ? "rgba(255,255,255,0.12)" : "rgba(0,0,0,0.08)" }}>
           <span style={{ ...S.tocTitle, color: theme.muted }}>Contents</span>
-          <button style={{ ...S.tocClose, color: theme.muted }} onClick={onClose} aria-label="Close contents">✕</button>
+          <button style={{ ...S.tocClose, color: theme.muted }} onClick={onClose} aria-label="Close">✕</button>
         </div>
+
         <div style={S.tocList} className="toc-list">
+          {toc.length > 0 && <div style={groupHead}>Chapters</div>}
           {toc.map((t, i) => (
             <button
-              key={i}
+              key={"t" + i}
               className="toc-item"
               style={{ ...S.tocItem, color: theme.text, paddingLeft: 18 + t.level * 16 }}
               onClick={() => onGo(t.id)}
@@ -900,8 +1156,69 @@ function TocDrawer({ theme, toc, onGo, onClose }) {
               {t.page ? <span style={{ ...S.tocPage, color: theme.muted }}>{t.page}</span> : null}
             </button>
           ))}
+
+          {bookmarks.length > 0 && <div style={groupHead}>Bookmarks</div>}
+          {bookmarks.map((b) => (
+            <div key={b.id} className="toc-row" style={S.tocRow}>
+              <button
+                className="toc-item"
+                style={{ ...S.tocItem, color: theme.text, flex: 1 }}
+                onClick={() => onGoRatio(b.ratio)}
+                title={b.label}
+              >
+                <span style={{ ...S.bmDot, background: ACCENT }} />
+                <span style={S.tocLabel}>{b.label}</span>
+                <span style={{ ...S.tocPage, color: theme.muted }}>{b.page ? b.page : Math.round(b.ratio * 100) + "%"}</span>
+              </button>
+              <button className="row-del" style={{ ...S.rowDel, color: theme.muted }} title="Remove bookmark" onClick={() => onRemoveBookmark(b.id)}>✕</button>
+            </div>
+          ))}
+
+          {highlights.length > 0 && <div style={groupHead}>Highlights</div>}
+          {highlights.map((h) => (
+            <div key={h.id} className="toc-row" style={S.tocRow}>
+              <button
+                className="toc-item"
+                style={{ ...S.tocItem, color: theme.text, flex: 1 }}
+                onClick={() => onGoHighlight(h)}
+                title={h.text}
+              >
+                <span style={{ ...S.bmDot, background: h.color }} />
+                <span style={S.tocLabel}>{(h.text || "").trim()}</span>
+              </button>
+              <button className="row-del" style={{ ...S.rowDel, color: theme.muted }} title="Remove highlight" onClick={() => onRemoveHighlight(h.id)}>✕</button>
+            </div>
+          ))}
         </div>
       </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * Highlight selection popover
+ * ------------------------------------------------------------------ */
+
+function HighlightPopover({ popover, onPick, onRemove }) {
+  const left = Math.min(Math.max(popover.x || 0, 80), window.innerWidth - 80);
+  const top = Math.max((popover.y || 0) - 12, 44);
+  return (
+    <div className="hl-popover" style={{ ...S.hlPop, left, top }} onMouseDown={(e) => e.stopPropagation()}>
+      {popover.mode === "remove" ? (
+        <button style={S.hlRemove} className="hl-remove" onClick={() => onRemove(popover.hlId)}>
+          Remove
+        </button>
+      ) : (
+        HL_COLORS.map((c) => (
+          <button
+            key={c.id}
+            className="hl-swatch"
+            style={{ ...S.hlSwatch, background: c.value }}
+            title={`Highlight (${c.id})`}
+            onClick={() => onPick(c.value)}
+          />
+        ))
+      )}
     </div>
   );
 }
@@ -911,7 +1228,7 @@ function TocDrawer({ theme, toc, onGo, onClose }) {
  * ------------------------------------------------------------------ */
 
 function ControlBar({
-  theme, playing, onToggle, hasToc, onToc, speed, onSpeed, fontFamily, onFontFamily,
+  theme, playing, onToggle, hasDrawer, onToc, onAddBookmark, speed, onSpeed, fontFamily, onFontFamily,
   fontSize, onFontSize, themeId, onTheme, progressLabel, onReset,
 }) {
   const dark = theme.dark;
@@ -924,12 +1241,12 @@ function ControlBar({
   return (
     <div style={S.barWrap}>
       <div style={{ ...S.bar, background: barBg }} className="control-bar">
-        {hasToc && (
+        {hasDrawer && (
           <button
             style={{ ...S.resetBtn, background: fieldBg, color: muted, fontSize: 16 }}
             onClick={onToc}
             className="icon-btn"
-            title="Table of contents"
+            title="Contents, bookmarks & highlights"
             aria-label="Table of contents"
           >
             ☰
@@ -1004,6 +1321,14 @@ function ControlBar({
         <div style={{ ...S.progress, color: muted }} title="Reading progress">
           {progressLabel}
         </div>
+
+        <button
+          style={{ ...S.resetBtn, background: fieldBg, color: muted, fontSize: 16 }}
+          onClick={onAddBookmark} className="icon-btn"
+          title="Bookmark this spot" aria-label="Add bookmark"
+        >
+          🔖
+        </button>
 
         <button
           style={{ ...S.resetBtn, background: fieldBg, color: muted }}
@@ -1104,8 +1429,25 @@ function GlobalStyle({ fontFamily, fontSize, theme }) {
     @keyframes tocIn { from { transform: translateX(-100%); } to { transform: translateX(0); } }
     .toc-item { transition: background 0.12s ease; }
     .toc-item:hover { background: ${theme.dark ? "rgba(255,255,255,0.07)" : "rgba(0,0,0,0.05)"}; }
+    .toc-row { transition: background 0.12s ease; }
+    .toc-row:hover { background: ${theme.dark ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.035)"}; }
+    .toc-row .row-del { opacity: 0; transition: opacity 0.12s ease; }
+    .toc-row:hover .row-del { opacity: 0.6; }
+    .toc-row .row-del:hover { opacity: 1; }
     .toc-list::-webkit-scrollbar { width: 8px; }
     .toc-list::-webkit-scrollbar-thumb { background: ${theme.dark ? "rgba(255,255,255,0.18)" : "rgba(0,0,0,0.16)"}; border-radius: 8px; }
+
+    .epub-content mark.hl {
+      border-radius: 3px; padding: 0.05em 0.05em; cursor: pointer;
+      -webkit-box-decoration-break: clone; box-decoration-break: clone;
+      color: inherit !important; transition: filter 0.12s ease;
+    }
+    .epub-content mark.hl:hover { filter: brightness(0.94); }
+
+    .hl-popover { animation: popIn 0.14s ease; }
+    @keyframes popIn { from { opacity: 0; transform: translate(-50%, -100%) scale(0.92); } to { opacity: 1; transform: translate(-50%, -100%) scale(1); } }
+    .hl-swatch { transition: transform 0.1s ease; }
+    .hl-swatch:hover { transform: scale(1.15); }
 
     .spinner { animation: spin 0.9s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
@@ -1216,6 +1558,34 @@ const S = {
   },
   tocLabel: { flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
   tocPage: { fontSize: 12, fontVariantNumeric: "tabular-nums", flex: "0 0 auto" },
+  tocGroup: {
+    fontSize: 10, fontWeight: 700, letterSpacing: "0.12em", textTransform: "uppercase",
+    padding: "16px 18px 6px", opacity: 0.85,
+  },
+  tocRow: { display: "flex", alignItems: "center" },
+  rowDel: {
+    border: "none", background: "transparent", cursor: "pointer", fontSize: 12,
+    padding: "0 14px", flex: "0 0 auto", opacity: 0.55,
+  },
+  bmDot: { width: 9, height: 9, borderRadius: "50%", flex: "0 0 auto", alignSelf: "center" },
+
+  // Highlight popover
+  hlPop: {
+    position: "fixed", zIndex: 30, transform: "translate(-50%, -100%)",
+    display: "flex", alignItems: "center", gap: 8, padding: "8px 10px",
+    borderRadius: 999, background: "rgba(40,38,35,0.95)", backdropFilter: "blur(10px)",
+    boxShadow: "0 8px 28px rgba(0,0,0,0.32)",
+  },
+  hlSwatch: { width: 22, height: 22, borderRadius: "50%", border: "1px solid rgba(255,255,255,0.35)", cursor: "pointer", padding: 0 },
+  hlRemove: {
+    border: "none", background: "transparent", color: "#fff", cursor: "pointer",
+    fontSize: 13, fontWeight: 600, padding: "2px 8px",
+  },
+  flashToast: {
+    position: "fixed", bottom: 92, left: "50%", transform: "translateX(-50%)",
+    color: "#fff", padding: "9px 18px", borderRadius: 999, fontSize: 13, zIndex: 25,
+    boxShadow: "0 8px 24px rgba(0,0,0,0.22)", pointerEvents: "none",
+  },
 
   // Control bar
   barWrap: {

@@ -27,6 +27,8 @@ the browser; there is no backend.
 - **Table of contents** — a contents drawer (☰ in the control bar) listing
   chapters (EPUB, from its navigation or chapter headings) or bookmarks (PDF
   outline). Click an entry to jump straight to it.
+- **Highlights** (EPUB) — select text and pick a color in the popover to highlight it; tap a highlight to remove it. Highlights are saved per book and reappear on reload.
+- **Bookmarks** — tap 🔖 to mark where you stopped (works for PDF & EPUB). Bookmarks and highlights are listed in the ☰ drawer; tap one to jump to it.
 - **Page color** picker — Paper, White, Sepia, Gray and Night themes, applied
   live to the whole reading surface.
 - **Progress indicator** in the control bar — percentage for EPUB, plus
