@@ -72,14 +72,18 @@ function savePref(key, value) {
 
 const DB_NAME = "scrollery";
 const STORE = "books";
+const META = "meta"; // small key/value store (e.g. the linked sync-file handle)
 
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1);
+    const req = indexedDB.open(DB_NAME, 2);
     req.onupgradeneeded = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains(STORE)) {
         db.createObjectStore(STORE, { keyPath: "id" });
+      }
+      if (!db.objectStoreNames.contains(META)) {
+        db.createObjectStore(META);
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -144,6 +148,113 @@ async function idbPatch(id, patch) {
   await idbPut(rec);
 }
 
+async function metaGet(key) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(META, "readonly");
+    const req = tx.objectStore(META).get(key);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function metaPut(key, value) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(META, "readwrite");
+    tx.objectStore(META).put(value, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function metaDelete(key) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(META, "readwrite");
+    tx.objectStore(META).delete(key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+/* ------------------------------------------------------------------ *
+ * Sync — portable reading state with NO backend. We never sync the heavy
+ * book files, only their fingerprint + reading state, so the payload stays
+ * tiny and merges cleanly across devices.
+ * ------------------------------------------------------------------ */
+
+const SYNC_VERSION = 1;
+
+// Reading-state slice of a book record (everything except the file bytes).
+const toSyncEntry = (rec) => ({
+  id: rec.id,
+  name: rec.name,
+  type: rec.type,
+  size: rec.size,
+  lastModified: rec.lastModified,
+  addedAt: rec.addedAt,
+  lastOpened: rec.lastOpened || 0,
+  progress: rec.progress || 0,
+  bookmarks: rec.bookmarks || [],
+  highlights: rec.highlights || [],
+});
+
+async function gatherSync() {
+  const all = await idbAll();
+  return { app: "scrollery", v: SYNC_VERSION, exportedAt: Date.now(), books: all.map(toSyncEntry) };
+}
+
+const unionById = (a = [], b = []) => {
+  const map = new Map();
+  [...a, ...b].forEach((x) => { if (x && x.id) map.set(x.id, x); });
+  return [...map.values()];
+};
+
+// Merge one incoming sync entry into local storage. Returns "added" | "updated" | "same".
+async function mergeSyncEntry(remote) {
+  if (!remote || !remote.id) return "same";
+  const local = await idbGet(remote.id);
+  if (!local) {
+    // No file here yet — keep a data-less placeholder so the state attaches
+    // automatically when this same file is added on this device later.
+    await idbPut({
+      id: remote.id, name: remote.name, type: remote.type, size: remote.size,
+      lastModified: remote.lastModified, addedAt: remote.addedAt || Date.now(),
+      lastOpened: remote.lastOpened || 0, progress: remote.progress || 0,
+      bookmarks: remote.bookmarks || [], highlights: remote.highlights || [],
+      data: null, placeholder: true,
+    });
+    return "added";
+  }
+  // Position follows whichever side was read more recently; marks are unioned.
+  const remoteNewer = (remote.lastOpened || 0) > (local.lastOpened || 0);
+  const merged = {
+    ...local,
+    progress: remoteNewer ? (remote.progress || 0) : local.progress,
+    lastOpened: Math.max(local.lastOpened || 0, remote.lastOpened || 0),
+    bookmarks: unionById(local.bookmarks, remote.bookmarks),
+    highlights: unionById(local.highlights, remote.highlights),
+  };
+  const changed =
+    merged.progress !== local.progress ||
+    merged.bookmarks.length !== (local.bookmarks || []).length ||
+    merged.highlights.length !== (local.highlights || []).length;
+  await idbPut(merged);
+  return changed ? "updated" : "same";
+}
+
+async function applySync(remote) {
+  if (!remote || !Array.isArray(remote.books)) throw new Error("not a Scrollery sync file");
+  let added = 0, updated = 0;
+  for (const entry of remote.books) {
+    const r = await mergeSyncEntry(entry);
+    if (r === "added") added++;
+    else if (r === "updated") updated++;
+  }
+  return { added, updated, total: remote.books.length };
+}
+
 // Strip the heavy `data` buffer before putting records into React state.
 const toMeta = (rec) => ({
   id: rec.id,
@@ -153,6 +264,7 @@ const toMeta = (rec) => ({
   addedAt: rec.addedAt,
   lastOpened: rec.lastOpened,
   progress: rec.progress || 0,
+  needsFile: !rec.data, // synced from another device; file not present here yet
 });
 
 /* ------------------------------------------------------------------ *
@@ -376,6 +488,13 @@ function App() {
   // Library
   const [library, setLibrary] = useState([]);
 
+  // Sync (no backend — portable file / linked cloud-folder file)
+  const [syncLinked, setSyncLinked] = useState(false);
+  const [syncMsg, setSyncMsg] = useState("");
+  const syncHandleRef = useRef(null);
+  const syncWriteTimerRef = useRef(null);
+  const supportsFsa = typeof window !== "undefined" && "showSaveFilePicker" in window;
+
   // Controls (persisted preferences)
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(() => loadPref("speed", 1.0));
@@ -428,7 +547,152 @@ function App() {
       /* IndexedDB unavailable — library just stays empty */
     }
   }, []);
-  useEffect(() => { refreshLibrary(); }, [refreshLibrary]);
+
+  /* ---------------------------------------------------------------- *
+   * Sync (no backend)
+   * ---------------------------------------------------------------- */
+
+  const flashSync = useCallback((msg) => {
+    setSyncMsg(msg);
+    clearTimeout(flashSync._t);
+    flashSync._t = setTimeout(() => setSyncMsg(""), 3200);
+  }, []);
+
+  // Manual: download a portable sync file.
+  const exportSync = useCallback(async () => {
+    const data = await gatherSync();
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "scrollery-sync.json";
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    flashSync(`Exported ${data.books.length} book${data.books.length === 1 ? "" : "s"}`);
+  }, [flashSync]);
+
+  // Manual: merge a portable sync file the user picked.
+  const importSyncFile = useCallback(async (file) => {
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const res = await applySync(JSON.parse(text));
+      await refreshLibrary();
+      flashSync(`Synced · ${res.added} new, ${res.updated} updated`);
+    } catch (e) {
+      flashSync("That doesn't look like a Scrollery sync file");
+    }
+  }, [refreshLibrary, flashSync]);
+
+  // Verify (and if needed request) read/write permission on a linked handle.
+  const ensurePermission = useCallback(async (handle, request) => {
+    if (!handle || !handle.queryPermission) return true;
+    const opts = { mode: "readwrite" };
+    if ((await handle.queryPermission(opts)) === "granted") return true;
+    if (request && (await handle.requestPermission(opts)) === "granted") return true;
+    return false;
+  }, []);
+
+  const readFromHandle = useCallback(async (handle) => {
+    const file = await handle.getFile();
+    const text = await file.text();
+    if (!text.trim()) return { added: 0, updated: 0, total: 0 };
+    return applySync(JSON.parse(text));
+  }, []);
+
+  const writeToHandle = useCallback(async (handle) => {
+    const data = await gatherSync();
+    const w = await handle.createWritable();
+    await w.write(JSON.stringify(data, null, 2));
+    await w.close();
+  }, []);
+
+  // Pick a file in a cloud-synced folder once; we read + write it automatically.
+  const linkSyncFile = useCallback(async () => {
+    try {
+      let handle;
+      const opts = {
+        suggestedName: "scrollery-sync.json",
+        types: [{ description: "Scrollery sync", accept: { "application/json": [".json"] } }],
+      };
+      // Let the user open an existing file, or create one if none exists yet.
+      if (window.showOpenFilePicker) {
+        try {
+          [handle] = await window.showOpenFilePicker({ types: opts.types });
+        } catch (_) {
+          handle = await window.showSaveFilePicker(opts);
+        }
+      } else {
+        handle = await window.showSaveFilePicker(opts);
+      }
+      if (!(await ensurePermission(handle, true))) { flashSync("Permission denied"); return; }
+      syncHandleRef.current = handle;
+      await metaPut("syncHandle", handle);
+      setSyncLinked(true);
+      // Pull anything already in the file, then push our current state.
+      let pulled = { added: 0, updated: 0 };
+      try { pulled = await readFromHandle(handle); } catch (_) {}
+      await writeToHandle(handle);
+      await refreshLibrary();
+      flashSync(`Linked · pulled ${pulled.added + pulled.updated} update${pulled.added + pulled.updated === 1 ? "" : "s"}`);
+    } catch (e) {
+      if (e && e.name !== "AbortError") flashSync("Could not link a sync file");
+    }
+  }, [ensurePermission, readFromHandle, writeToHandle, refreshLibrary, flashSync]);
+
+  const unlinkSyncFile = useCallback(async () => {
+    syncHandleRef.current = null;
+    setSyncLinked(false);
+    await metaDelete("syncHandle").catch(() => {});
+    flashSync("Auto-sync turned off");
+  }, [flashSync]);
+
+  // Manual pull+push for the linked file.
+  const syncNow = useCallback(async () => {
+    const handle = syncHandleRef.current;
+    if (!handle) return;
+    try {
+      if (!(await ensurePermission(handle, true))) { flashSync("Permission needed"); return; }
+      const res = await readFromHandle(handle).catch(() => ({ added: 0, updated: 0 }));
+      await writeToHandle(handle);
+      await refreshLibrary();
+      flashSync(`Synced · ${res.added} new, ${res.updated} updated`);
+    } catch (e) {
+      flashSync("Sync failed");
+    }
+  }, [ensurePermission, readFromHandle, writeToHandle, refreshLibrary, flashSync]);
+
+  // Debounced background push to the linked file after local changes.
+  const scheduleSyncPush = useCallback(() => {
+    const handle = syncHandleRef.current;
+    if (!handle) return;
+    clearTimeout(syncWriteTimerRef.current);
+    syncWriteTimerRef.current = setTimeout(async () => {
+      try {
+        if (await ensurePermission(handle, false)) await writeToHandle(handle);
+      } catch (_) { /* ignore — user can Sync now */ }
+    }, 2500);
+  }, [ensurePermission, writeToHandle]);
+
+  // On mount: reconnect a previously linked file and pull updates.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      await refreshLibrary();
+      if (!supportsFsa) return;
+      try {
+        const handle = await metaGet("syncHandle");
+        if (!handle || cancelled) return;
+        syncHandleRef.current = handle;
+        setSyncLinked(true);
+        if (await ensurePermission(handle, false)) {
+          await readFromHandle(handle).catch(() => {});
+          await refreshLibrary();
+        }
+      } catch (_) { /* no linked file */ }
+    })();
+    return () => { cancelled = true; };
+  }, [refreshLibrary, supportsFsa, ensurePermission, readFromHandle]);
 
   /* ---------------------------------------------------------------- *
    * Progress + saving
@@ -440,8 +704,9 @@ function App() {
     clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
       idbSaveProgress(id, ratio).catch(() => {});
+      scheduleSyncPush();
     }, 500);
-  }, []);
+  }, [scheduleSyncPush]);
 
   const updateProgress = useCallback(() => {
     const el = scrollRef.current;
@@ -641,10 +906,11 @@ function App() {
       if (currentBookIdRef.current) idbPatch(currentBookIdRef.current, { bookmarks: next }).catch(() => {});
       return next;
     });
+    scheduleSyncPush();
     setFlash("Bookmark added");
     clearTimeout(addBookmark._t);
     addBookmark._t = setTimeout(() => setFlash(""), 1500);
-  }, []);
+  }, [scheduleSyncPush]);
 
   const removeBookmark = useCallback((id) => {
     setBookmarks((prev) => {
@@ -652,7 +918,8 @@ function App() {
       if (currentBookIdRef.current) idbPatch(currentBookIdRef.current, { bookmarks: next }).catch(() => {});
       return next;
     });
-  }, []);
+    scheduleSyncPush();
+  }, [scheduleSyncPush]);
 
   /* ---------------------------------------------------------------- *
    * Highlights (EPUB text layer)
@@ -673,7 +940,8 @@ function App() {
       if (currentBookIdRef.current) idbPatch(currentBookIdRef.current, { highlights: next }).catch(() => {});
       return next;
     });
-  }, []);
+    scheduleSyncPush();
+  }, [scheduleSyncPush]);
 
   const removeHighlight = useCallback((id) => {
     setPopover({ visible: false });
@@ -683,7 +951,8 @@ function App() {
       if (currentBookIdRef.current) idbPatch(currentBookIdRef.current, { highlights: next }).catch(() => {});
       return next;
     });
-  }, []);
+    scheduleSyncPush();
+  }, [scheduleSyncPush]);
 
   // Selection → highlight popover (EPUB only; PDF canvas has no text layer).
   useEffect(() => {
@@ -860,9 +1129,9 @@ function App() {
 
       let rec;
       try {
-        const existing = await idbGet(id); // resume if we've seen it before
+        const existing = await idbGet(id); // resume (or attach synced state) if seen
         rec = existing
-          ? { ...existing, data: buffer, lastOpened: Date.now() }
+          ? { ...existing, data: buffer, placeholder: false, lastOpened: Date.now() }
           : {
               id, name: file.name, type, size: file.size,
               lastModified: file.lastModified, addedAt: Date.now(),
@@ -884,6 +1153,11 @@ function App() {
     try {
       const rec = await idbGet(id);
       if (!rec) { setError("That book is no longer stored."); refreshLibrary(); return; }
+      if (!rec.data) {
+        // Synced from another device but the file isn't here — ask for it.
+        setError("Add this book's file on this device to read it — your progress and notes are saved.");
+        return;
+      }
       rec.lastOpened = Date.now();
       idbPut(rec).catch(() => {});
       openRecord(rec);
@@ -949,6 +1223,11 @@ function App() {
           onPick={loadFile}
           onOpen={openFromLibrary}
           onRemove={removeFromLibrary}
+          sync={{
+            supportsFsa, linked: syncLinked, message: syncMsg,
+            onExport: exportSync, onImport: importSyncFile,
+            onLink: linkSyncFile, onUnlink: unlinkSyncFile, onSyncNow: syncNow,
+          }}
         />
       ) : (
         <>
@@ -1025,9 +1304,10 @@ function App() {
 
 function UploadZone({
   theme, dragging, error, library,
-  onDragOver, onDragLeave, onDrop, onPick, onOpen, onRemove,
+  onDragOver, onDragLeave, onDrop, onPick, onOpen, onRemove, sync,
 }) {
   const inputRef = useRef(null);
+  const importRef = useRef(null);
   return (
     <div style={S.uploadOuter}>
       <div style={S.brand}>
@@ -1076,8 +1356,48 @@ function UploadZone({
           <div style={{ ...S.libraryHead, color: theme.muted }}>Your Library</div>
           <div style={S.libraryGrid}>
             {library.map((b) => (
-              <LibraryCard key={b.id} book={b} theme={theme} onOpen={onOpen} onRemove={onRemove} />
+              <LibraryCard
+                key={b.id}
+                book={b}
+                theme={theme}
+                onOpen={b.needsFile ? () => inputRef.current && inputRef.current.click() : onOpen}
+                onRemove={onRemove}
+              />
             ))}
+          </div>
+        </div>
+      )}
+
+      {sync && (
+        <div style={S.syncWrap}>
+          <div style={{ ...S.libraryHead, color: theme.muted }}>Sync · no account needed</div>
+          <div style={S.syncRow}>
+            {sync.supportsFsa && (
+              sync.linked ? (
+                <>
+                  <button style={{ ...S.syncBtn, ...S.syncBtnPrimary }} className="sync-btn" onClick={sync.onSyncNow}>↻ Sync now</button>
+                  <button style={{ ...S.syncBtn, color: theme.text, borderColor: theme.dark ? "rgba(255,255,255,0.2)" : "rgba(0,0,0,0.15)" }} className="sync-btn" onClick={sync.onUnlink}>Unlink</button>
+                </>
+              ) : (
+                <button style={{ ...S.syncBtn, ...S.syncBtnPrimary }} className="sync-btn" onClick={sync.onLink}>🔗 Link a cloud file (auto)</button>
+              )
+            )}
+            <button style={{ ...S.syncBtn, color: theme.text, borderColor: theme.dark ? "rgba(255,255,255,0.2)" : "rgba(0,0,0,0.15)" }} className="sync-btn" onClick={sync.onExport}>⤓ Export</button>
+            <button style={{ ...S.syncBtn, color: theme.text, borderColor: theme.dark ? "rgba(255,255,255,0.2)" : "rgba(0,0,0,0.15)" }} className="sync-btn" onClick={() => importRef.current && importRef.current.click()}>⤒ Import</button>
+            <input
+              ref={importRef}
+              type="file"
+              accept=".json,application/json"
+              style={{ display: "none" }}
+              onChange={(e) => { sync.onImport(e.target.files && e.target.files[0]); e.target.value = ""; }}
+            />
+          </div>
+          <div style={{ ...S.syncHint, color: theme.muted }}>
+            {sync.message
+              ? sync.message
+              : sync.supportsFsa
+              ? "Link a file inside an iCloud/Dropbox/Drive folder to sync automatically, or Export/Import to move your progress, bookmarks & highlights between devices."
+              : "Export your progress, bookmarks & highlights to a file and Import it on another device. (Auto cloud-file sync needs Chrome or Edge on desktop.)"}
           </div>
         </div>
       )}
@@ -1095,7 +1415,7 @@ function LibraryCard({ book, theme, onOpen, onRemove }) {
         background: theme.dark ? "rgba(255,255,255,0.06)" : "rgba(255,255,255,0.7)",
       }}
       onClick={() => onOpen(book.id)}
-      title={`Open "${book.name}"`}
+      title={book.needsFile ? `Add "${book.name}" on this device` : `Open "${book.name}"`}
     >
       <button
         className="lib-del"
@@ -1105,13 +1425,17 @@ function LibraryCard({ book, theme, onOpen, onRemove }) {
       >
         ✕
       </button>
-      <div style={{ ...S.libBadge, color: ACCENT }}>{book.type.toUpperCase()}</div>
-      <div style={{ ...S.libName, color: theme.text }}>{book.name}</div>
+      <div style={{ ...S.libBadge, color: ACCENT }}>
+        {book.type.toUpperCase()}{book.needsFile ? " · SYNCED" : ""}
+      </div>
+      <div style={{ ...S.libName, color: theme.text, opacity: book.needsFile ? 0.7 : 1 }}>{book.name}</div>
       <div style={S.libBarTrack}>
         <div style={{ ...S.libBarFill, width: pct + "%" }} />
       </div>
       <div style={{ ...S.libMeta, color: theme.muted }}>
-        {pct > 0 ? `${pct}% read` : "Not started"}
+        {book.needsFile
+          ? `${pct}% · add file to read`
+          : pct > 0 ? `${pct}% read` : "Not started"}
       </div>
     </div>
   );
@@ -1425,6 +1749,10 @@ function GlobalStyle({ fontFamily, fontSize, theme }) {
     .lib-card .lib-del { opacity: 0; transition: opacity 0.15s ease; }
     .lib-card:hover .lib-del { opacity: 1; }
 
+    .sync-btn { transition: transform 0.12s ease, filter 0.15s ease, background 0.15s ease; }
+    .sync-btn:hover { transform: translateY(-1px); filter: brightness(1.05); }
+    .sync-btn:active { transform: translateY(0); }
+
     .toc-panel { animation: tocIn 0.22s cubic-bezier(0.22,1,0.36,1); }
     @keyframes tocIn { from { transform: translateX(-100%); } to { transform: translateX(0); } }
     .toc-item { transition: background 0.12s ease; }
@@ -1510,6 +1838,17 @@ const S = {
   libBarTrack: { height: 4, borderRadius: 999, background: "rgba(0,0,0,0.10)", overflow: "hidden" },
   libBarFill: { height: "100%", background: ACCENT, borderRadius: 999, transition: "width 0.3s ease" },
   libMeta: { fontSize: 11 },
+
+  // Sync
+  syncWrap: { width: "min(720px, 92vw)", textAlign: "center" },
+  syncRow: { display: "flex", flexWrap: "wrap", gap: 10, justifyContent: "center" },
+  syncBtn: {
+    border: "1px solid transparent", background: "transparent", cursor: "pointer",
+    borderRadius: 999, padding: "8px 16px", fontSize: 13, fontWeight: 600,
+    display: "inline-flex", alignItems: "center", gap: 6,
+  },
+  syncBtnPrimary: { background: ACCENT, color: "#fff", borderColor: ACCENT },
+  syncHint: { fontSize: 12.5, marginTop: 12, lineHeight: 1.5, maxWidth: 560, marginLeft: "auto", marginRight: "auto" },
 
   // Reader
   scroll: {

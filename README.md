@@ -33,6 +33,7 @@ the browser; there is no backend.
   live to the whole reading surface.
 - **Progress indicator** in the control bar — percentage for EPUB, plus
   `Page x / y` for PDF.
+- **Sync across devices — no account, no server.** Your reading state (progress, bookmarks, highlights) can move between devices two ways: **Export/Import** a small `scrollery-sync.json` file (works in every browser), or **link a sync file** inside a folder your iCloud/Dropbox/Drive already syncs (Chrome/Edge desktop) so it updates automatically. Only reading state is synced — open the same book file on the other device and it jumps to where you left off.
 - **Remembered Library** — every book you open is saved locally (IndexedDB),
   along with how far you've read. Reopen the app and your shelf is waiting;
   click any book to jump straight back to where you left off. Font, size,
